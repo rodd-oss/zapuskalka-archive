@@ -1,24 +1,34 @@
 use flate2::Compression;
 use flate2::{read::GzDecoder, write::GzEncoder};
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use tar::{Archive, Builder};
+use tauri::async_runtime::spawn;
+use tauri::State;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     LogicalPosition, LogicalSize, Manager,
 };
+use tokio::process::Command;
+use tokio::sync::broadcast::error::RecvError;
+use tokio::sync::Mutex;
 
+use crate::process_monitor::{ProcessEvent, ProcessMonitor};
 use crate::rate_meter::RateMeter;
 use crate::tracking_reader::TrackingReader;
 use crate::tracking_tokio_stream::TrackingTokioStream;
 use crate::tracking_writer::TrackingWriter;
 
+mod models;
+mod process_monitor;
 mod rate_meter;
+mod states;
 mod tracking_reader;
 mod tracking_tokio_stream;
 mod tracking_writer;
@@ -341,6 +351,137 @@ async fn upload_file_as_form_data(
     Ok(())
 }
 
+// TODO: for now we return PID of launched program, but application can spawn actual program
+//       and then terminate entrypoint program. Ideally we should track all children spawned
+//       by entrypoint. When we will do that here we should return not PID, but some key
+//       which can be used to query/wait when application terminated.
+#[tauri::command]
+async fn launch_app(
+    app_id: String,
+    app_config_path: State<'_, states::ConfigDirPath>,
+    app_pid_map: State<'_, states::AppPidMap>,
+    proc_mon: State<'_, states::ProcessMonitorInstance>,
+) -> Result<u32, String> {
+    // App ids name files inside the config dir; reject anything that could
+    // escape it (path separators, "..", etc).
+    if app_id.is_empty()
+        || !app_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("Invalid app id".to_string());
+    }
+
+    // Hold the map lock for the whole launch so two concurrent launches of
+    // the same app cannot both spawn a process.
+    let mut app_pid_map = app_pid_map.lock().await;
+    if let Some(pid) = app_pid_map.appid2pid.get(&app_id) {
+        return Ok(*pid);
+    }
+
+    let config_dir_path = &app_config_path.inner().0;
+    let app_json_path = config_dir_path.join(format!("apps/{}.json", app_id));
+
+    let contents = tokio::fs::read(&app_json_path)
+        .await
+        .map_err(|e| format!("Failed to read app json file: {}", e))?;
+    let app_info = serde_json::from_slice::<models::InstalledAppInfo>(&contents)
+        .map_err(|e| format!("Failed to parse app json: {}", e))?;
+
+    if app_info.entrypoint.is_empty() {
+        return Err("App has no entrypoint configured".to_string());
+    }
+
+    let entrypoint_path = app_info.install_dir.join(&app_info.entrypoint);
+    if !entrypoint_path.exists() {
+        return Err(format!(
+            "Entrypoint does not exist: {}",
+            entrypoint_path.display()
+        ));
+    }
+
+    let app_child = Command::new(&entrypoint_path)
+        .current_dir(&app_info.install_dir)
+        .spawn()
+        .map_err(|e| format!("Failed to spawn app process: {}", e))?;
+    let pid = app_child
+        .id()
+        .ok_or_else(|| "Child not started".to_string())?;
+
+    app_pid_map.appid2pid.insert(app_id.clone(), pid);
+    app_pid_map.pid2appid.insert(pid, app_id);
+    proc_mon.lock().await.add(pid, app_child).await;
+
+    Ok(pid)
+}
+
+#[tauri::command]
+async fn is_app_running(
+    app_id: String,
+    app_pid_map: State<'_, states::AppPidMap>,
+) -> Result<bool, String> {
+    Ok(app_pid_map.lock().await.appid2pid.contains_key(&app_id))
+}
+
+#[tauri::command]
+async fn wait_for_app_close(
+    app_id: String,
+    app_pid_map: State<'_, states::AppPidMap>,
+    proc_mon: State<'_, states::ProcessMonitorInstance>,
+) -> Result<(), String> {
+    // Subscribe before checking the map, so a termination happening between
+    // the check and the subscription cannot be missed.
+    let mut rx = proc_mon.lock().await.subscribe();
+
+    let pid = match app_pid_map.lock().await.appid2pid.get(&app_id) {
+        Some(v) => *v,
+        // Not in the map means already closed (or never launched) —
+        // nothing to wait for.
+        None => return Ok(()),
+    };
+
+    loop {
+        match rx.recv().await {
+            Ok(ProcessEvent::Terminated(terminated_pid)) => {
+                if terminated_pid == pid {
+                    break;
+                }
+            }
+            Err(RecvError::Lagged(_)) => {
+                // Our event may be among the missed ones. Give the cleanup
+                // listener a moment to update the map, then re-check.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if app_pid_map.lock().await.appid2pid.get(&app_id) != Some(&pid) {
+                    break;
+                }
+            }
+            Err(RecvError::Closed) => break,
+        }
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn terminate_app(
+    app_id: String,
+    app_pid_map: State<'_, states::AppPidMap>,
+    proc_mon: State<'_, states::ProcessMonitorInstance>,
+) -> Result<(), String> {
+    let pid = if let Some(v) = app_pid_map.lock().await.appid2pid.get(&app_id) {
+        *v
+    } else {
+        return Err("Application not running".to_string());
+    };
+
+    proc_mon
+        .lock()
+        .await
+        .terminate(pid)
+        .await
+        .map_err(|e| format!("Failed to terminate process: {:?}", e))
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct WindowState {
     width: f64,
@@ -599,6 +740,38 @@ pub fn run() {
                 .build(app)
                 .map_err(|e| format!("Failed to create tray icon: {}", e))?;
 
+            // App configs are written by the frontend under app_config_dir
+            // (BaseDirectory.AppConfig) — keep the launch side in sync.
+            app.manage(states::ConfigDirPath(app.path().app_config_dir()?));
+            app.manage(Arc::new(Mutex::new(states::AppPidMapInner {
+                appid2pid: HashMap::new(),
+                pid2appid: HashMap::new(),
+            })));
+
+            let proc_mon = ProcessMonitor::new();
+            let mut proc_mon_rx_for_listener = proc_mon.subscribe();
+            app.manage(Arc::new(Mutex::new(proc_mon)));
+
+            // Remove entry from App2Pid state on app termination
+            let app_handle_for_procmon_listener = app.handle().clone();
+            spawn(async move {
+                loop {
+                    match proc_mon_rx_for_listener.recv().await {
+                        Ok(ProcessEvent::Terminated(pid)) => {
+                            let app_pid_map_state =
+                                app_handle_for_procmon_listener.state::<states::AppPidMap>();
+                            let mut app_pid_map = app_pid_map_state.lock().await;
+                            let appid = app_pid_map.pid2appid.remove(&pid);
+                            if let Some(appid) = appid {
+                                app_pid_map.appid2pid.remove(&appid);
+                            }
+                        }
+                        Err(RecvError::Lagged(_)) => continue,
+                        Err(RecvError::Closed) => break,
+                    }
+                }
+            });
+
             Ok(())
         })
         .plugin(tauri_plugin_opener::init())
@@ -606,7 +779,11 @@ pub fn run() {
             archive_and_compress_folder,
             read_file_bytes,
             extract_archive,
-            upload_file_as_form_data
+            upload_file_as_form_data,
+            launch_app,
+            is_app_running,
+            wait_for_app_close,
+            terminate_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

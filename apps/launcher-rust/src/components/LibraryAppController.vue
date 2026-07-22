@@ -128,6 +128,24 @@ const calculateState = async () => {
 
   saveAppConfig(config.value)
   state.value = 'ready'
+
+  if (await invoke('is_app_running', { appId: config.value.id })) {
+    // Deliberately not awaited: calculateState must not block until the
+    // app closes (launch/update/delete flows await calculateState).
+    void watchAppClose(config.value.id)
+  }
+}
+
+// Show 'running' until the app closes, whatever way the wait ends
+const watchAppClose = async (appId: string) => {
+  state.value = 'running'
+  try {
+    await invoke('wait_for_app_close', { appId })
+  } catch (e) {
+    console.error('wait_for_app_close failed:', e)
+  } finally {
+    state.value = 'ready'
+  }
 }
 
 onMounted(calculateState)
@@ -314,16 +332,35 @@ const launch = async () => {
     await update()
   }
 
+  if (state.value == 'running') {
+    // Already running; calculateState is watching it
+    return
+  }
+
   if (config.value == undefined) {
     throw new Error('State error. Should not call if config is not loaded')
   }
 
-  const entrypointPath = await path.join(config.value.installDir, config.value.entrypoint)
+  try {
+    await invoke('launch_app', { appId: config.value.id })
+  } catch (e) {
+    actionError.value = `failed to launch application (${e})`
+    return
+  }
 
-  await openPath(entrypointPath)
+  await watchAppClose(config.value.id)
 }
 
-const close = async () => {}
+const close = async () => {
+  if (config.value == undefined) {
+    return
+  }
+  try {
+    await invoke('terminate_app', { appId: config.value.id })
+  } catch (e) {
+    actionError.value = `failed to close application (${e})`
+  }
+}
 
 const openLocalFiles = async () => {
   if (config.value == undefined) {
