@@ -8,6 +8,12 @@
   [![Latest Release](https://img.shields.io/github/v/release/rodd-oss/zapuskalka?label=Latest%20Release&style=for-the-badge)](https://github.com/rodd-oss/zapuskalka/releases/latest)
 </div>
 
+## Передача прав / Rights transfer
+
+Проект Zapuskalka продолжается как закрытое программное обеспечение. Авторов, чей код есть в этом архиве, просят подписать [Соглашение об отчуждении исключительного права](legal/RIGHTS-TRANSFER.md), добавив файл в [`legal/signatures/`](legal/signatures/README.md) со своей учётной записи GitHub. Лицензия самого архива (MPL 2.0) не меняется.
+
+Zapuskalka continues as closed-source software. Contributors whose code is in this archive are asked to sign the [Copyright Assignment Agreement](legal/RIGHTS-TRANSFER.md) by adding a file under [`legal/signatures/`](legal/signatures/README.md) from their own GitHub account. The archive's own licence (MPL 2.0) does not change.
+
 ## About
 
 Zapuskalka is a modern open-source launcher designed for indie game players and developers. The project combines the ease of use of Steam with the open distribution model of itch.io, providing a free and fair platform for indie content distribution.
